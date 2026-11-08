@@ -33,6 +33,8 @@ services:
 networks:
   board:
     name: selfnow_board
+    driver_opts:
+      com.docker.network.bridge.name: br-selfnow     # a fixed bridge name, so a host firewall rule can match it
     ipam:
       config:
         - subnet: "${SELFNOW_SUBNET:?set SELFNOW_SUBNET}"
