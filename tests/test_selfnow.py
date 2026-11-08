@@ -176,19 +176,17 @@ def test_spoofed_forwarded_header_from_a_direct_peer_does_not_reset_the_limit(ap
     app.max_records_per_slug = 1000
     publish(app)
     c = cookie_of(unlock(app))
-    for i in range(30):
-        insert(app, c, idem=f"s{i}", client=CLIENT)
-    # a peer that is not the proxy sends its own X-Forwarded-For: the header is ignored, the peer is the key
-    h = {"host": HOST, "x-forwarded-for": "198.51.100.1", "cookie": c, "content-type": "application/json",
-         "idempotency-key": "spoof"}
     body = json.dumps({"token": "t", "round": 1, "amend": False, "payload": "{}"}).encode()
-    first = app.public("POST", "/alpha-1/.herenow/data/feedback", h, body, "192.0.2.50")
-    assert first.status in (200, 201)         # counted against 192.0.2.50, not 198.51.100.1
-    again = app.public("POST", "/alpha-1/.herenow/data/feedback", dict(h, **{"x-forwarded-for": "198.51.100.2",
-                                                                              "idempotency-key": "spoof2"}), body, "192.0.2.50")
-    assert again.status in (200, 201)
-    # the proxied client that already hit the limit is still limited
-    assert insert(app, c, idem="s-final", client=CLIENT).status == 429
+    base = {"host": HOST, "cookie": c, "content-type": "application/json"}
+    # a peer that is not the proxy rotates its own X-Forwarded-For: the header is ignored, the peer is the key
+    for i in range(30):
+        h = dict(base, **{"x-forwarded-for": f"198.51.100.{i}", "idempotency-key": f"d{i}"})
+        assert app.public("POST", "/alpha-1/.herenow/data/feedback", h, body, "192.0.2.50").status in (200, 201)
+    h = dict(base, **{"x-forwarded-for": "198.51.100.250", "idempotency-key": "d-over"})
+    assert app.public("POST", "/alpha-1/.herenow/data/feedback", h, body, "192.0.2.50").status == 429
+    # a different direct peer is counted on its own
+    h = dict(base, **{"x-forwarded-for": "198.51.100.1", "idempotency-key": "d-other"})
+    assert app.public("POST", "/alpha-1/.herenow/data/feedback", h, body, "192.0.2.51").status in (200, 201)
 
 
 def test_rate_limit_window_expires(app, clock):
