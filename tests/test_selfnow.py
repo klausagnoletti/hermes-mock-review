@@ -340,3 +340,59 @@ def test_retention_deletes_old_sites_and_their_records(tmp_path, clock):
     clock.t += 8 * 86400
     assert app.sweep() == 1
     assert owner(app, "GET", "/publishes/alpha-1/data/feedback").status == 404
+
+
+# ---- guards added after the first implementation pass -----------------------------------------
+
+def test_ten_wrong_passwords_lock_the_client_out_for_the_window(app, clock):
+    publish(app)
+    for _ in range(10):
+        assert unlock(app, password="nope").status == 401
+    assert unlock(app, password="pw-correct-horse").status == 429       # even the right one, while locked out
+    clock.t += 601
+    assert unlock(app, password="pw-correct-horse").status in (200, 303)
+
+
+@pytest.mark.parametrize("path", ["/alpha-1\n/", "/alpha-1/ ", "/alpha-1/%0a", "/alpha-1/..\\x"])
+def test_control_characters_in_a_public_path_are_refused(app, path):
+    publish(app)
+    r = public(app, "GET", path)
+    assert r.status in (400, 404)
+    assert b"board" not in r.body
+
+
+def test_a_new_site_is_locked_until_the_owner_sets_a_password(app):
+    owner(app, "PUT", "/publish/alpha-1", make_tar(SITE))
+    r = public(app, "GET", "/alpha-1/")
+    assert r.status == 401
+    assert unlock(app, password="anything-at-all").status == 401
+
+
+def test_changing_the_password_invalidates_old_cookies(app):
+    publish(app)
+    c = cookie_of(unlock(app))
+    assert public(app, "GET", "/alpha-1/", headers={"cookie": c}).status == 200
+    owner(app, "PATCH", "/publish/alpha-1/metadata", json.dumps({"password": "another-pass-9"}).encode())
+    assert public(app, "GET", "/alpha-1/", headers={"cookie": c}).status == 401
+
+
+def test_null_password_opens_the_board_and_short_password_is_refused(app):
+    publish(app)
+    r = owner(app, "PATCH", "/publish/alpha-1/metadata", json.dumps({"password": "short"}).encode())
+    assert r.status == 400
+    owner(app, "PATCH", "/publish/alpha-1/metadata", json.dumps({"password": None}).encode())
+    assert public(app, "GET", "/alpha-1/").status == 200
+
+
+def test_list_pagination_returns_a_stable_cursor(app):
+    app.max_records_per_slug = 1000
+    publish(app)
+    c = cookie_of(unlock(app))
+    for i in range(3):
+        insert(app, c, idem=f"p{i}", client=f"203.0.113.{i + 20}")
+    first = json.loads(owner(app, "GET", "/publishes/alpha-1/data/feedback?limit=2").body)
+    assert len(first["records"]) == 2 and first["nextCursor"]
+    second = json.loads(owner(app, "GET", f"/publishes/alpha-1/data/feedback?limit=2&cursor={first['nextCursor']}").body)
+    assert len(second["records"]) == 1 and second["nextCursor"] in (None, "")
+    ids = [r["id"] for r in first["records"] + second["records"]]
+    assert ids == sorted(ids) and len(set(ids)) == 3
