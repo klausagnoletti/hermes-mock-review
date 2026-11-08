@@ -1,4 +1,5 @@
-FROM python:3.12-slim
+# Pinned by digest (the multi-architecture index, so the same line builds on amd64 and arm64). Update it on purpose.
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 
 # Standard library only: the server is two files, no pip install.
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin selfnow

@@ -20,6 +20,7 @@ import re
 import secrets as _secrets
 import shutil
 import tarfile
+import threading
 import time
 from collections import defaultdict
 from http.cookies import SimpleCookie
@@ -32,6 +33,12 @@ MAX_PUBLIC_BODY = 16 * 1024
 MAX_PAYLOAD = 15000
 MAX_SITE_FILES = 2000
 MAX_SITE_BYTES = 25 * 1024 * 1024
+MAX_FILE_BYTES = 8 * 1024 * 1024    # one file is read whole per request: INFLIGHT x this must stay well under the memory limit
+COOKIE_TTL_S = 14 * 86400
+SCRYPT_WAIT_S = 5                   # at most 2 hashes run at once (16 MiB each); a third waits this long, then 503
+INFLIGHT = 16                       # requests the public listener handles at once
+INFLIGHT_WAIT_S = 5
+GC_ABOVE = 2048                     # drop expired counter keys once a counter map is this large
 RATE_LIMIT = 30
 RATE_WINDOW = 3600
 UNLOCK_FAILS = 10
@@ -101,18 +108,28 @@ class App:
         self.retention_days = retention_days
         self._hits = defaultdict(list)     # (slug, client) -> insert timestamps
         self._fails = defaultdict(list)    # (slug, client) -> failed unlock timestamps
+        self._insert_lock = threading.Lock()
+        self._scrypt_slots = threading.BoundedSemaphore(2)
         self._secret = self._load_secret()
 
     # ---- state ---------------------------------------------------------------------------------
 
     def _load_secret(self) -> bytes:
+        """The cookie signing key: exactly 32 random bytes, written whole under a private name and renamed into place,
+        so a crash can never leave a short or empty key behind. A key of any other length is replaced."""
         p = self.root / "cookie.key"
-        if p.exists():
-            return p.read_bytes()
+        if p.is_file():
+            key = p.read_bytes()
+            if len(key) == 32:
+                return key
         key = _secrets.token_bytes(32)
-        fd = _fd_open(str(p), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        tmp = self.root / ("cookie.key.%s.tmp" % _secrets.token_hex(4))
+        fd = _fd_open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(key)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
         return key
 
     def _dir(self, slug: str) -> Path:
@@ -165,9 +182,14 @@ class App:
 
     # ---- gate cookie -----------------------------------------------------------------------------
 
-    def _gate_value(self, slug: str, meta: Dict[str, Any]) -> str:
-        msg = ("%s|%s" % (slug, meta.get("gate_version", 0))).encode("utf-8")
+    def _gate_mac(self, slug: str, meta: Dict[str, Any], issued: int) -> str:
+        """Bound to this site lifetime (gate_salt is new for every created site) and to the password version."""
+        msg = ("%s|%s|%s|%d" % (slug, meta.get("gate_version", 0), meta.get("gate_salt", ""), issued)).encode("utf-8")
         return hmac.new(self._secret, msg, hashlib.sha256).hexdigest()
+
+    def _gate_value(self, slug: str, meta: Dict[str, Any]) -> str:
+        issued = int(self.clock())
+        return "%d.%s" % (issued, self._gate_mac(slug, meta, issued))
 
     def _unlocked(self, slug: str, meta: Dict[str, Any], headers: Dict[str, str]) -> bool:
         if meta.get("gate") == "open":
@@ -180,7 +202,16 @@ class App:
         except Exception:
             return False
         morsel = jar.get("gate")
-        return bool(morsel) and hmac.compare_digest(morsel.value, self._gate_value(slug, meta))
+        if not morsel:
+            return False
+        stamp, dot, mac = morsel.value.partition(".")
+        if not dot or not re.fullmatch(r"[0-9]{1,12}", stamp):
+            return False
+        issued = int(stamp)
+        age = self.clock() - issued
+        if age < -60 or age > COOKIE_TTL_S:
+            return False
+        return hmac.compare_digest(mac.encode("utf-8", "replace"), self._gate_mac(slug, meta, issued).encode("ascii"))
 
     @staticmethod
     def _hash_password(password: str, salt: Optional[bytes] = None) -> str:
@@ -229,6 +260,8 @@ class App:
             return self._secure(_err(404, "not found"))
         if method not in ("GET", "HEAD"):
             return self._secure(_err(405, "method not allowed"))
+        if rest == []:      # "/slug": the gate form and relative asset links need the trailing slash
+            return self._secure(Response(308, b"", {"location": "/%s/" % slug}, ctype="text/plain"))
         if not self._unlocked(slug, meta, headers):
             return self._secure(Response(401, GATE_PAGE, ctype="text/html; charset=utf-8"))
         return self._serve(slug, rest)
@@ -236,7 +269,8 @@ class App:
     def _serve(self, slug: str, rest: List[str]) -> Response:
         if any(p in (".", "..") or p.startswith(".") or "\\" in p or "\x00" in p for p in rest if p != ""):
             return self._secure(_err(404, "not found"))
-        rel = "/".join(p for p in rest if p != "") or "index.html"
+        clean = [p for p in rest if p != ""]
+        rel = "/".join(clean) or "index.html"
         base = (self._dir(slug) / "current").resolve()
         target = (base / rel).resolve()
         if target.is_dir():
@@ -250,14 +284,30 @@ class App:
         ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         if ctype.startswith("text/") or ctype in ("application/javascript", "image/svg+xml", "application/json"):
             ctype += "; charset=utf-8"
-        is_round = rest[:1] == ["rounds"]
+        is_round = clean[:1] == ["rounds"]       # from the same cleaned segments the file is resolved from
         resp = Response(200, target.read_bytes(), ctype=ctype)
         return self._secure(resp, VARIANT_CSP if is_round else BOARD_CSP)
+
+    def _gc(self, counters: Dict, window: float, now: float) -> None:
+        """Drop keys whose every timestamp has expired, once the map is large (an attacker rotating addresses)."""
+        if len(counters) < GC_ABOVE:
+            return
+        for k, ts in list(counters.items()):      # list(): a snapshot, other request threads add keys meanwhile
+            if not ts or now - ts[-1] >= window:
+                counters.pop(k, None)
+
+    @staticmethod
+    def _forget(stamps: List[float], t: float) -> None:
+        try:
+            stamps.remove(t)
+        except ValueError:
+            pass
 
     def _unlock(self, slug, meta, headers, body, peer) -> Response:
         client = self._client(headers, peer)
         now = self.clock()
         key = (slug, client)
+        self._gc(self._fails, UNLOCK_WINDOW, now)
         self._fails[key] = [t for t in self._fails[key] if now - t < UNLOCK_WINDOW]
         if len(self._fails[key]) >= UNLOCK_FAILS:
             return self._secure(_err(429, "too many attempts"))
@@ -265,9 +315,22 @@ class App:
             return self._secure(_err(401, "locked"))
         form = parse_qs(body.decode("utf-8", "replace"))
         pw = (form.get("password") or [""])[0]
-        if not pw or not self._check_password(pw, meta["password_hash"]):
+        if not pw:
             self._fails[key].append(now)
             return self._secure(_err(401, "wrong password"))
+        # The guess is counted BEFORE the slow hash runs, so a burst cannot get past the lockout while hashes are
+        # in flight; a correct password removes its own entry again.
+        self._fails[key].append(now)
+        if not self._scrypt_slots.acquire(timeout=SCRYPT_WAIT_S):
+            self._forget(self._fails[key], now)
+            return self._secure(_err(503, "busy, try again"))
+        try:
+            ok = self._check_password(pw, meta["password_hash"])
+        finally:
+            self._scrypt_slots.release()
+        if not ok:
+            return self._secure(_err(401, "wrong password"))
+        self._forget(self._fails[key], now)
         cookie = "gate=%s; Path=/%s/; Secure; HttpOnly; SameSite=Lax" % (self._gate_value(slug, meta), slug)
         return self._secure(Response(303, b"", {"set-cookie": cookie, "location": "./"}, ctype="text/plain"))
 
@@ -280,8 +343,6 @@ class App:
         idem = headers.get("idempotency-key", "")
         idem_dir = self._dir(slug) / "idem"
         idem_file = idem_dir / hashlib.sha256(idem.encode("utf-8")).hexdigest() if idem else None
-        if idem_file is not None and idem_file.is_file():
-            return self._secure(_json(200, {"ok": True, "id": idem_file.read_text(encoding="utf-8")}))
         try:
             data = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
@@ -292,29 +353,35 @@ class App:
                 or not 1 <= rnd <= 999 or not isinstance(amend, bool) or not isinstance(payload, str)
                 or len(payload) > MAX_PAYLOAD):
             return self._secure(_err(400, "invalid record"))
-        now = self.clock()
         client = self._client(headers, peer)
         key = (slug, client)
-        self._hits[key] = [t for t in self._hits[key] if now - t < RATE_WINDOW]
-        if len(self._hits[key]) >= RATE_LIMIT:
-            return self._secure(_err(429, "too many submits from this network"))
-        rdir = self._records(slug)
-        rdir.mkdir(exist_ok=True)
-        existing = sorted(rdir.glob("*.json"))
-        if len(existing) >= self.max_records_per_slug:
-            return self._secure(_err(409, "this board has reached its feedback limit"))
-        seq = (int(existing[-1].stem) + 1) if existing else 1
-        rec_id = "%08d" % seq
-        created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-        rec = {"id": rec_id, "createdAt": created,
-               "data": {"token": token, "round": rnd, "amend": amend, "payload": payload}}
-        tmp = rdir / (rec_id + ".tmp")
-        tmp.write_text(json.dumps(rec), encoding="utf-8")
-        os.replace(tmp, rdir / (rec_id + ".json"))
-        if idem_file is not None:
-            idem_dir.mkdir(exist_ok=True)
-            idem_file.write_text(rec_id, encoding="utf-8")
-        self._hits[key].append(now)
+        with self._insert_lock:     # the sequence number, the idempotency record and the write are one step
+            if idem_file is not None and idem_file.is_file():
+                return self._secure(_json(200, {"ok": True, "id": idem_file.read_text(encoding="utf-8")}))
+            now = self.clock()
+            self._gc(self._hits, RATE_WINDOW, now)
+            self._hits[key] = [t for t in self._hits[key] if now - t < RATE_WINDOW]
+            if len(self._hits[key]) >= RATE_LIMIT:
+                return self._secure(_err(429, "too many submits from this network"))
+            rdir = self._records(slug)
+            rdir.mkdir(exist_ok=True)
+            existing = sorted(rdir.glob("*.json"))
+            if len(existing) >= self.max_records_per_slug:
+                return self._secure(_err(409, "this board has reached its feedback limit"))
+            if self._total_bytes() + len(body) > self.max_total_bytes:
+                return self._secure(_err(507, "the store is full"))
+            seq = (int(existing[-1].stem) + 1) if existing else 1
+            rec_id = "%08d" % seq
+            created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+            rec = {"id": rec_id, "createdAt": created,
+                   "data": {"token": token, "round": rnd, "amend": amend, "payload": payload}}
+            tmp = rdir / ("%s.%s.tmp" % (rec_id, _secrets.token_hex(4)))
+            tmp.write_text(json.dumps(rec), encoding="utf-8")
+            os.replace(tmp, rdir / (rec_id + ".json"))
+            if idem_file is not None:
+                idem_dir.mkdir(exist_ok=True)
+                idem_file.write_text(rec_id, encoding="utf-8")
+            self._hits[key].append(now)
         return self._secure(_json(200, {"ok": True, "id": rec_id}))
 
     # ---- owner listener --------------------------------------------------------------------------
@@ -355,16 +422,25 @@ class App:
         except ValueError as e:
             return self._secure(_err(400, str(e)))
         sdir = self._dir(slug)
+        is_new = not self._exists(slug)
         vdir = sdir / "v"
-        vdir.mkdir(parents=True, exist_ok=True)
         vid = _secrets.token_hex(8)
         staging = vdir / (vid + ".staging")
-        for name, data in files.items():
-            dest = staging / name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(data)
-        if not files:
-            staging.mkdir()
+        try:
+            vdir.mkdir(parents=True, exist_ok=True)
+            for name, data in files.items():
+                dest = staging / name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(data)
+            if not files:
+                staging.mkdir()
+        except Exception as e:      # a half-written upload leaves neither staging files nor an empty slug directory
+            shutil.rmtree(staging, ignore_errors=True)
+            if is_new:
+                shutil.rmtree(sdir, ignore_errors=True)
+            if isinstance(e, (FileExistsError, NotADirectoryError)):
+                return self._secure(_err(400, "file names conflict (a name is both a file and a folder)"))
+            raise
         final = vdir / vid
         os.replace(staging, final)
         link_tmp = sdir / ("current.%s.tmp" % vid)
@@ -375,6 +451,7 @@ class App:
             shutil.rmtree(old, ignore_errors=True)
         now = self.clock()
         meta = self._meta(slug) if self._exists(slug) else {"gate": "locked", "gate_version": 0, "created": now}
+        meta.setdefault("gate_salt", _secrets.token_hex(16))     # new for every site lifetime: old cookies never fit a recreated board
         meta["updated"] = now
         self._save_meta(slug, meta)
         return self._secure(_json(200, {"ok": True, "slug": slug}))
@@ -384,7 +461,7 @@ class App:
         out = {}   # type: Dict[str, bytes]
         total = 0
         try:
-            tf = tarfile.open(fileobj=io.BytesIO(body), mode="r:*")
+            tf = tarfile.open(fileobj=io.BytesIO(body), mode="r:")      # plain tar only: no compression to inflate
         except tarfile.TarError:
             raise ValueError("not a tar archive")
         with tf:
@@ -397,6 +474,8 @@ class App:
                     continue
                 if not m.isreg():
                     raise ValueError("only regular files are accepted")
+                if m.size > MAX_FILE_BYTES:
+                    raise ValueError("a file is too large")
                 total += m.size
                 if len(out) >= MAX_SITE_FILES or total > MAX_SITE_BYTES:
                     raise ValueError("archive is too large")
@@ -464,6 +543,8 @@ class App:
                 updated = json.loads((d / "meta.json").read_text(encoding="utf-8")).get("updated", 0)
             except (OSError, ValueError):
                 continue
+            if not isinstance(updated, (int, float)) or isinstance(updated, bool):
+                continue        # a damaged timestamp must neither stop the sweeper nor delete the site
             if updated < cutoff:
                 shutil.rmtree(d, ignore_errors=True)
                 removed += 1
@@ -480,6 +561,7 @@ REQUEST_TIMEOUT_S = 30
 def make_server(app: App, kind: str, host: str, port: int) -> ThreadingHTTPServer:
     """kind is 'public' or 'owner'. The body limit is enforced here, before anything is buffered."""
     limit = MAX_PUBLIC_BODY if kind == "public" else app.max_total_bytes
+    inflight = threading.BoundedSemaphore(INFLIGHT)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "selfnow"
@@ -491,16 +573,29 @@ def make_server(app: App, kind: str, host: str, port: int) -> ThreadingHTTPServe
             return
 
         def _handle(self) -> None:
+            if self.headers.get("Transfer-Encoding") is not None:
+                return self._send(App._secure(_err(400, "transfer-encoding is not supported")), close=True)
             raw_len = self.headers.get("Content-Length")
             body = b""
-            if self.command in ("POST", "PUT", "PATCH"):
+            takes_body = self.command in ("POST", "PUT", "PATCH")
+            if takes_body:
                 if raw_len is None or not raw_len.isdigit():
                     return self._send(App._secure(_err(411, "content-length required")), close=True)
                 if int(raw_len) > limit:
                     return self._send(App._secure(_err(413, "request too large")), close=True)
                 body = self.rfile.read(int(raw_len))
+            # A body on a method that takes none is never read; closing after the answer keeps it from being parsed
+            # as the next request on this connection (request smuggling behind a pooling proxy).
+            close = not takes_body and raw_len not in (None, "0")
             handler = app.public if kind == "public" else app.owner
-            self._send(handler(self.command, self.path, dict(self.headers.items()), body, self.client_address[0]))
+            if kind == "public" and not inflight.acquire(timeout=INFLIGHT_WAIT_S):
+                return self._send(App._secure(_err(503, "busy, try again")), close=True)
+            try:
+                resp = handler(self.command, self.path, dict(self.headers.items()), body, self.client_address[0])
+            finally:
+                if kind == "public":
+                    inflight.release()
+            self._send(resp, close=close)
 
         def _send(self, resp: Response, close: bool = False) -> None:
             body = b"" if self.command == "HEAD" else resp.body

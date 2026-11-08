@@ -9,6 +9,8 @@
 # Everything else exits 2 before any request is made. The request goes to the owner listener on host loopback
 # (SELFNOW_OWNER_URL, default http://127.0.0.1:8081). The response body is printed, then a final line "STATUS <code>".
 set -eu
+PATH=/usr/bin:/bin
+export PATH
 
 base="${SELFNOW_OWNER_URL:-http://127.0.0.1:8081}"
 cmd="${SSH_ORIGINAL_COMMAND-}"
@@ -62,7 +64,7 @@ case "$method" in
 esac
 
 if [ "$has_body" = yes ]; then
-    exec curl -sS --max-time 300 -X "$method" -H "Content-Type: $ctype" --data-binary @- \
+    exec curl -sS --proto =http --max-time 300 -X "$method" -H "Content-Type: $ctype" --data-binary @- \
         -w '\nSTATUS %{http_code}\n' "$base$path"
 fi
-exec curl -sS --max-time 60 -X "$method" -w '\nSTATUS %{http_code}\n' "$base$path"
+exec curl -sS --proto =http --max-time 60 -X "$method" -w '\nSTATUS %{http_code}\n' "$base$path"

@@ -263,8 +263,8 @@ def _api_ssh(alias: str, method: str, path: str, timeout: float, body: Optional[
     if method not in ("PUT", "PATCH", "GET", "DELETE") or not _OWNER_PATH.fullmatch(path):
         raise HereNowError("selfhost request refused", 400)
     stdin = raw if raw is not None else (json.dumps(body).encode("utf-8") if body is not None else b"")
-    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
-            "--", alias, f"{method} {path}"]
+    argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
+            "-o", "ClearAllForwardings=yes", "--", alias, f"{method} {path}"]
     try:
         proc = subprocess.run(argv, input=stdin, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:

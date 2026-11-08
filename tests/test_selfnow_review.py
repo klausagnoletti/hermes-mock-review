@@ -322,6 +322,12 @@ def test_a_failed_republish_leaves_the_old_site_and_no_staging(app):
     assert get(app, "/alpha-1/", cookie_of(unlock(app))).status == 200
 
 
+def test_a_compressed_archive_is_refused(app):
+    import gzip
+    r = owner(app, "PUT", "/publish/alpha-1", gzip.compress(make_tar(SITE)))
+    assert r.status == 400 and b"not a tar" in r.body
+
+
 def test_one_file_over_the_per_file_cap_is_refused(app):
     big = b"x" * (selfnow.MAX_FILE_BYTES + 1)
     r = owner(app, "PUT", "/publish/alpha-1", make_tar({"index.html": b"x", "big.bin": big}))
