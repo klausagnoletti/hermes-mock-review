@@ -323,6 +323,15 @@ def test_a_failed_republish_leaves_the_old_site_and_no_staging(app):
     assert get(app, "/alpha-1/", cookie_of(unlock(app))).status == 200
 
 
+def test_the_slug_cap_refuses_a_new_site_but_not_an_update(tmp_path, clock):
+    a = selfnow.App(data_dir=tmp_path / "d", public_host=HOST, clock=clock, max_slugs=2)
+    assert owner(a, "PUT", "/publish/aa-1", make_tar(SITE)).status == 200
+    assert owner(a, "PUT", "/publish/bb-2", make_tar(SITE)).status == 200
+    assert owner(a, "PUT", "/publish/cc-3", make_tar(SITE)).status == 409
+    assert owner(a, "PUT", "/publish/aa-1", make_tar(SITE)).status == 200
+    assert sorted(p.name for p in a.sites.iterdir()) == ["aa-1", "bb-2"]
+
+
 def test_a_compressed_archive_is_refused(app):
     import gzip
     r = owner(app, "PUT", "/publish/alpha-1", gzip.compress(make_tar(SITE)))
