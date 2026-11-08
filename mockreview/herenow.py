@@ -163,6 +163,14 @@ def _apply_password(review_id: str) -> Dict[str, Any]:
 gated_prototype = store.gated_prototype
 
 
+def _site_on_base(site_url: str) -> bool:
+    """With a self-hosted base configured, the browser may only load that host (never a stored URL for another one)."""
+    base = settings.get("selfhost_base") if settings.get("selfhost_ssh") else ""
+    if not base:
+        return True
+    return urllib.parse.urlsplit(site_url).netloc.lower() == urllib.parse.urlsplit(base).netloc.lower()
+
+
 def _verify_site(review_id: str) -> Dict[str, Any]:
     """Caller holds .publish.lock and the password gate is live. Load the real board behind its password in a browser
     (browsercheck): any 4xx/5xx or failed subresource, an unstyled frame or a missing browser fails the publish, and
@@ -176,6 +184,8 @@ def _verify_site(review_id: str) -> Dict[str, Any]:
     problem: Optional[browsercheck.BrowserCheckError] = None
     if not site_url or not secret:
         problem = browsercheck.BrowserCheckError("the site URL or password is not stored")
+    elif not _site_on_base(site_url):
+        problem = browsercheck.BrowserCheckError("the site URL is not on the configured self-host base")
     else:
         try:
             browsercheck.verify_board(site_url, secret, n, variant=vid)

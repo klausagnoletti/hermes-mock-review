@@ -208,6 +208,33 @@ def test_a_republish_reuses_the_slug(hn_review, monkeypatch):
     assert puts == [f"PUT /publish/{first}", f"PUT /publish/{first}"]
 
 
+def test_the_browser_never_loads_a_site_url_outside_the_configured_base(hn_review, monkeypatch):
+    use_ssh(monkeypatch)
+    herenow.publish(hn_review["id"], verify=False)
+    with store.locked(hn_review["id"]):
+        d = store.load(hn_review["id"])
+        d["herenow"].update(site_url="https://elsewhere.example.test/mr-x/", password="pw words here")
+        store.save(hn_review["id"], d)
+    monkeypatch.setattr(herenow.browsercheck, "verify_board", lambda *a, **k: pytest.fail("browser launched"))
+    with pytest.raises(herenow.HereNowError) as e:
+        herenow._verify_site(hn_review["id"])
+    assert e.value.status == 502 and "configured" in str(e.value)
+    assert store.load(hn_review["id"])["herenow"]["verify_status"] == "failed"
+
+
+def test_a_site_url_on_the_configured_base_reaches_the_browser(hn_review, monkeypatch):
+    use_ssh(monkeypatch)
+    herenow.publish(hn_review["id"], verify=False)
+    with store.locked(hn_review["id"]):
+        d = store.load(hn_review["id"])
+        d["herenow"]["password"] = "pw words here"
+        store.save(hn_review["id"], d)
+    seen = []
+    monkeypatch.setattr(herenow.browsercheck, "verify_board", lambda url, *a, **k: seen.append(url))
+    herenow._verify_site(hn_review["id"])
+    assert len(seen) == 1 and seen[0].startswith(BASE + "/")
+
+
 def test_a_failed_upload_is_reported_and_stores_no_url(hn_review, monkeypatch):
     use_ssh(monkeypatch, (0, b'{"ok": false, "error": "store is full"}\nSTATUS 413\n'))
     with pytest.raises(herenow.HereNowError) as e:
