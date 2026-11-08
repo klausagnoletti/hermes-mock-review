@@ -334,6 +334,14 @@ def test_wrapper_only_speaks_http(tmp_path):
     assert b"LEAK" not in r.stdout and r.returncode != 0
 
 
+def test_wrapper_only_speaks_http_for_uploads_too(tmp_path):
+    (tmp_path / "publish").mkdir()
+    (tmp_path / "publish" / "alpha-1").write_text("LEAK", encoding="utf-8")
+    r = run_wrapper("file://" + str(tmp_path), "PUT /publish/alpha-1", b"UPLOADED")
+    assert b"LEAK" not in r.stdout and r.returncode != 0
+    assert (tmp_path / "publish" / "alpha-1").read_text(encoding="utf-8") == "LEAK"
+
+
 def test_wrapper_sends_the_body_only_with_put_and_patch_and_with_the_right_content_type(recorder):
     seen, url = recorder
     run_wrapper(url, "PUT /publish/alpha-1", b"TARBYTES")

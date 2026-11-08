@@ -93,8 +93,9 @@ def test_a_tampered_cookie_expiry_is_refused(app, clock):
     value = cookie_of(unlock(app)).split("=", 1)[1]
     issued, _, mac = value.partition(".")
     assert mac, "cookie value must be <issued>.<mac>"
-    forged = "gate=%d.%s" % (int(issued) + 10 * selfnow.COOKIE_TTL_S, mac)
     clock.t += selfnow.COOKIE_TTL_S + 5
+    assert get(app, "/alpha-1/", "gate=" + value).status == 401          # expired as issued
+    forged = "gate=%d.%s" % (int(clock.t) - 10, mac)                       # same signature, fresh-looking stamp
     assert get(app, "/alpha-1/", forged).status == 401
 
 
