@@ -446,3 +446,28 @@ def test_real_listener_round_trip_and_headers(tmp_path, clock):
     finally:
         pub.shutdown()
         own.shutdown()
+
+
+def test_ipv6_clients_in_one_64_share_a_rate_counter(app):
+    app.max_records_per_slug = 1000
+    publish(app)
+    c = cookie_of(unlock(app))
+    for i in range(15):
+        assert insert(app, c, idem=f"a{i}", client="2001:db8:1:2::1").status in (200, 201)
+        assert insert(app, c, idem=f"b{i}", client="2001:db8:1:2::ffff").status in (200, 201)
+    assert insert(app, c, idem="a-over", client="2001:db8:1:2::abcd").status == 429
+    assert insert(app, c, idem="other-64", client="2001:db8:1:3::1").status in (200, 201)
+
+
+def test_hidden_files_in_an_archive_are_refused(app):
+    publish(app)
+    assert owner(app, "PUT", "/publish/alpha-1", make_tar({"index.html": b"x", ".env": b"secret"})).status == 400
+
+
+def test_the_client_is_the_rightmost_forwarded_entry_not_a_value_the_client_supplied(app):
+    app.max_records_per_slug = 1000
+    publish(app)
+    c = cookie_of(unlock(app))
+    for i in range(30):    # the visitor invents a new leftmost entry each time; the proxy appends the real one
+        assert insert(app, c, idem=f"x{i}", client=f"198.51.100.{i}, {CLIENT}").status in (200, 201)
+    assert insert(app, c, idem="x-over", client="198.51.100.200, " + CLIENT).status == 429

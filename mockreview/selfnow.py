@@ -376,7 +376,6 @@ class App:
             for m in tf:
                 name = m.name
                 if (not name or name.startswith("/") or "\\" in name or "\x00" in name or len(name) > 255
-                        or any(p in ("..", ".") and p != name for p in name.split("/") if p == "..")
                         or ".." in name.split("/")):
                     raise ValueError("unsafe path in archive")
                 if m.isdir():
