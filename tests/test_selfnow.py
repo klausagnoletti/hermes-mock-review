@@ -469,3 +469,53 @@ def test_the_client_is_the_rightmost_forwarded_entry_not_a_value_the_client_supp
     for i in range(30):    # the visitor invents a new leftmost entry each time; the proxy appends the real one
         assert insert(app, c, idem=f"x{i}", client=f"198.51.100.{i}, {CLIENT}").status in (200, 201)
     assert insert(app, c, idem="x-over", client="198.51.100.200, " + CLIENT).status == 429
+
+
+# ---- secrets never echoed -------------------------------------------------------------------
+
+PLANTED = "Planted-Secret-pw-7731"
+
+
+def _everything(resp):
+    return (resp.body.decode("utf-8", "replace") + " " +
+            " ".join(f"{k}: {v}" for k, v in resp.headers.items() if k != "set-cookie"))
+
+
+def test_a_planted_password_never_reaches_a_response_or_a_log(app, caplog, capsys, monkeypatch):
+    import logging
+    caplog.set_level(logging.DEBUG)
+    seen = []
+    seen.append(owner(app, "PUT", "/publish/alpha-1", make_tar(SITE)))
+    seen.append(owner(app, "PATCH", "/publish/alpha-1/metadata", json.dumps({"password": PLANTED}).encode()))
+    seen.append(owner(app, "PATCH", "/publish/alpha-1/metadata", json.dumps({"password": PLANTED[:5]}).encode()))
+    seen.append(unlock(app, password=PLANTED + "x"))                       # wrong password carrying the planted text
+    seen.append(unlock(app, password=PLANTED))                              # right one: only Set-Cookie may differ
+    cookie = cookie_of(seen[-1])
+    seen.append(public(app, "GET", "/alpha-1/", headers={"cookie": cookie}))
+    seen.append(public(app, "POST", "/alpha-1/.herenow/data/feedback", PLANTED.encode(),
+                       {"cookie": cookie, "content-type": "application/json"}))
+    seen.append(public(app, "POST", "/alpha-1/unlock", (PLANTED * 2000).encode(),
+                       {"content-type": "application/x-www-form-urlencoded"}))        # oversize
+    seen.append(owner(app, "GET", "/publishes/alpha-1/data/feedback"))
+
+    def boom(*a, **k):
+        raise RuntimeError("explode with " + PLANTED)
+    monkeypatch.setattr(app, "_insert", boom)
+    seen.append(public(app, "POST", "/alpha-1/.herenow/data/feedback", b"{}",
+                       {"cookie": cookie, "content-type": "application/json"}))          # the generic 500 path
+    assert seen[-1].status == 500
+    for r in seen:
+        assert PLANTED not in _everything(r)
+    out = capsys.readouterr()
+    assert PLANTED not in out.out + out.err + caplog.text
+    sc = seen[4].headers["set-cookie"]
+    assert PLANTED not in sc and "gate=" in sc
+
+
+def test_the_password_and_cookie_key_are_not_stored_in_clear(app, tmp_path):
+    owner(app, "PUT", "/publish/alpha-1", make_tar(SITE))
+    owner(app, "PATCH", "/publish/alpha-1/metadata", json.dumps({"password": PLANTED}).encode())
+    for f in (tmp_path / "data").rglob("*"):
+        if f.is_file() and f.name != "cookie.key":
+            assert PLANTED.encode() not in f.read_bytes()
+    assert (tmp_path / "data" / "cookie.key").stat().st_mode & 0o077 == 0     # key file is private
