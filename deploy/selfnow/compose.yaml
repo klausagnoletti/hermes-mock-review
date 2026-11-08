@@ -16,8 +16,12 @@ services:
     security_opt: ["no-new-privileges:true"]
     mem_limit: 256m
     memswap_limit: 256m
+    oom_score_adj: 500          # on a shared host the OOM killer takes this container before its neighbours
     init: true
     pids_limit: 128
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
     tmpfs: ["/tmp:size=16m"]
     volumes:
       - "${SELFNOW_DATA:?set SELFNOW_DATA to a host directory owned by uid 10001}:/data"
