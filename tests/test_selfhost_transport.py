@@ -97,6 +97,46 @@ def test_garbled_wrapper_output_is_a_502(selfhost, monkeypatch):
     assert e.value.status == 502
 
 
+def test_a_nonzero_ssh_exit_is_an_error_even_when_the_output_looks_fine(selfhost, monkeypatch):
+    use_ssh(monkeypatch, (1, b'{"ok": true}\nSTATUS 200\n'))
+    with pytest.raises(herenow.HereNowError) as e:
+        herenow._api("GET", "/publishes/alpha-1/data/feedback")
+    assert e.value.status == 502
+
+
+def test_a_success_status_with_a_body_that_is_not_json_is_a_502(selfhost, monkeypatch):
+    use_ssh(monkeypatch, (0, b"<html>not json</html>\nSTATUS 200\n"))
+    with pytest.raises(herenow.HereNowError) as e:
+        herenow._api("GET", "/publishes/alpha-1/data/feedback")
+    assert e.value.status == 502
+
+
+@pytest.mark.parametrize("method", ["POST", "OPTIONS", "put", "HEAD", "PUT ", ""])
+def test_a_method_outside_the_four_is_refused_before_ssh(selfhost, monkeypatch, method):
+    fake = use_ssh(monkeypatch)
+    with pytest.raises(herenow.HereNowError) as e:
+        herenow._api(method, "/publish/alpha-1")
+    assert e.value.status == 400 and fake.calls == []
+
+
+def test_the_uploaded_tar_holds_only_plain_visible_files_with_normalised_owner_and_mode(tmp_path):
+    site = tmp_path / "site"
+    (site / "sub").mkdir(parents=True)
+    (site / ".hidden-dir").mkdir()
+    (site / "a.txt").write_text("a", encoding="utf-8")
+    (site / "sub" / "b.txt").write_text("b", encoding="utf-8")
+    (site / "a.txt").chmod(0o600)
+    (site / ".manifest").write_text("m", encoding="utf-8")
+    (site / ".hidden-dir" / "c.txt").write_text("c", encoding="utf-8")
+    (site / "sub" / ".x").write_text("x", encoding="utf-8")
+    (site / "link.txt").symlink_to(site / "a.txt")
+    with tarfile.open(fileobj=io.BytesIO(herenow._tar_site(site))) as tf:
+        members = tf.getmembers()
+    assert sorted(m.name for m in members) == ["a.txt", "sub/b.txt"]
+    assert all(m.isreg() and m.uid == 0 and m.gid == 0 and m.uname == "" and m.gname == "" and m.mode == 0o644
+               for m in members)
+
+
 @pytest.mark.parametrize("path", ["/publish/alpha-1\n", "/publish/alpha-1 x", "/publish/../x", "publish/alpha-1",
                                   "/publish/alpha-1;id", "/publish/ALPHA", "/publishes/a/data/feedback?limit=1&x=$(id)"])
 def test_a_path_that_could_inject_into_the_remote_command_is_refused_before_ssh(selfhost, monkeypatch, path):
@@ -230,6 +270,8 @@ def test_wrapper_allows_exactly_the_four_owner_operations(owner_listener):
     "GET /etc/passwd", "GET /publishes/alpha-1/data/feedback?limit=1;id", "GET /publishes/alpha-1/data/feedback?x=$(id)",
     "GET /publishes/alpha-1/data/feedback?limit=1 -o /tmp/x", "GET http://evil.test/", "GET //evil.test/publishes/a",
     "PUT /publish/alpha-1 --data x", "PUT /publish/\u00e5lpha",
+    "PUT http://evil.test/publish/alpha-1", "PUT /x/publish/alpha-1", "GET /etc/../publishes/alpha-1/data/feedback",
+    "GET /x/publishes/alpha-1/data/feedback", "DELETE /a/publish/alpha-1", "PATCH /a/publish/alpha-1/metadata",
 ])
 def test_wrapper_refuses_everything_else_without_reaching_the_server(owner_listener, command):
     app, url = owner_listener
@@ -244,3 +286,43 @@ def test_wrapper_does_not_pass_a_request_body_to_get_or_delete(owner_listener):
     # a GET with stdin must not turn into a body-carrying request or change anything
     r = run_wrapper(url, "GET /publishes/alpha-1/data/feedback", b"ignored body")
     assert status_of(r) == 200 and (app.sites / "alpha-1" / "meta.json").exists()
+
+
+@pytest.fixture
+def recorder():
+    """A stand-in owner listener that records exactly what the wrapper put on the wire."""
+    import http.server
+    seen = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def _any(self):
+            n = int(self.headers.get("content-length") or 0)
+            seen.append({"method": self.command, "path": self.path, "body": self.rfile.read(n) if n else b"",
+                         "ctype": self.headers.get("content-type")})
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok": true}')
+        do_GET = do_PUT = do_PATCH = do_DELETE = _any
+
+        def log_message(self, format, *args):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield seen, f"http://127.0.0.1:{srv.server_address[1]}"
+    srv.shutdown()
+
+
+def test_wrapper_sends_the_body_only_with_put_and_patch_and_with_the_right_content_type(recorder):
+    seen, url = recorder
+    run_wrapper(url, "PUT /publish/alpha-1", b"TARBYTES")
+    run_wrapper(url, "PATCH /publish/alpha-1/metadata", b'{"password": null}')
+    run_wrapper(url, "GET /publishes/alpha-1/data/feedback?limit=100", b"smuggled")
+    run_wrapper(url, "DELETE /publish/alpha-1", b"smuggled")
+    assert seen == [
+        {"method": "PUT", "path": "/publish/alpha-1", "body": b"TARBYTES", "ctype": "application/octet-stream"},
+        {"method": "PATCH", "path": "/publish/alpha-1/metadata", "body": b'{"password": null}', "ctype": "application/json"},
+        {"method": "GET", "path": "/publishes/alpha-1/data/feedback?limit=100", "body": b"", "ctype": None},
+        {"method": "DELETE", "path": "/publish/alpha-1", "body": b"", "ctype": None},
+    ]
