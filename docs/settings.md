@@ -41,6 +41,8 @@ Look settings and the first three feedback settings are copied into each review 
 - `herenow_password` (bool, default `true`). Env: `MOCKREVIEW_HERENOW_PASSWORD`. Password protect new here.now reviews. Stored per review; change an existing review with mockreview password `<id>` on|off.
 - `ask_host_each_time` (bool, default `true`). Env: `MOCKREVIEW_ASK_HOST_EACH_TIME`. Ask the user tailnet, local or here.now before every review (read by the skill and tool text, not enforced in code).
 - `public_base` (str, default `(empty)`). Env: `MOCKREVIEW_PUBLIC_BASE`. Tailnet URL for review links. Empty: detect MagicDNS with tailscale status --json.
+- `selfhost_ssh` (str, default `(empty)`). Env: `MOCKREVIEW_SELFHOST_SSH`. ssh host alias of your own publish server's owner endpoint (key login, forced command). Empty uses here.now. Needs selfhost_base. Reviews keep the herenow mode; only where the site is stored changes.
+- `selfhost_base` (str, default `(empty)`). Env: `MOCKREVIEW_SELFHOST_BASE`. https URL your self-hosted boards are served from, for example https://boards.example.org. Required when selfhost_ssh is set.
 - `host` (str, default `127.0.0.1`, one of `127.0.0.1`, `localhost`, `::1`, `0.0.0.0`). Env: `MOCKREVIEW_HOST`. Address the board server binds. Loopback (default) keeps it on this computer (tailnet via tailscale serve); 0.0.0.0 shares it with every device on your network, unauthenticated, so local links open on other devices.
 - `owner` (str, default `auto`, one of `auto`, `service`, `self`). Env: `MOCKREVIEW_OWNER`. Who owns board storage and wake-ups: the running board server. auto = use this process's own store when the server watches it; inside a Kanban worker whose store is not watched, create in the server's store instead (reported in the result); anywhere else refuse rather than publish an orphan board. service = always the server's store. self = this process's store, no server check (own server, tests).
 - `port` (int, default `8790`, 1 to 65535). Env: `MOCKREVIEW_PORT`. Port the board server binds.
@@ -100,6 +102,8 @@ mock-review settings (config: Hermes ctx.get_config, read with Hermes)
   herenow_password = true  (default)
   ask_host_each_time = true  (default)
   public_base = (empty)  (default)
+  selfhost_ssh = (empty)  (default)
+  selfhost_base = (empty)  (default)
   host = 127.0.0.1  (default)
   owner = auto  (default)
   port = 8790  (default)

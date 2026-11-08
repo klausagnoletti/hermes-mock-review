@@ -106,6 +106,11 @@ SPEC: List[Setting] = [
     Setting("ask_host_each_time", "bool", True, "Ask the user tailnet, local or here.now before every review "
             "(read by the skill and tool text, not enforced in code).", "hosting"),
     Setting("public_base", "str", "", "Tailnet URL for review links. Empty: detect MagicDNS with tailscale status --json.", "hosting"),
+    Setting("selfhost_ssh", "str", "", "ssh host alias of your own publish server's owner endpoint (key login, forced command). "
+            "Empty uses here.now. Needs selfhost_base. Reviews keep the herenow mode; only where the site is stored changes.",
+            "hosting"),
+    Setting("selfhost_base", "str", "", "https URL your self-hosted boards are served from, for example https://boards.example.org. "
+            "Required when selfhost_ssh is set.", "hosting"),
     Setting("host", "str", "127.0.0.1", "Address the board server binds. Loopback (default) keeps it on this "
             "computer (tailnet via tailscale serve); 0.0.0.0 shares it with every device on your network, "
             "unauthenticated, so local links open on other devices.", "hosting",

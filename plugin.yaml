@@ -117,6 +117,14 @@ config_schema:
     type: str
     default: ""
     description: "Tailnet URL for review links. Empty: detect MagicDNS with tailscale status --json. Env: MOCKREVIEW_PUBLIC_BASE."
+  selfhost_ssh:
+    type: str
+    default: ""
+    description: "ssh host alias of your own publish server's owner endpoint (key login, forced command). Empty uses here.now. Needs selfhost_base. Reviews keep the herenow mode; only where the site is stored changes. Env: MOCKREVIEW_SELFHOST_SSH."
+  selfhost_base:
+    type: str
+    default: ""
+    description: "https URL your self-hosted boards are served from, for example https://boards.example.org. Required when selfhost_ssh is set. Env: MOCKREVIEW_SELFHOST_BASE."
   host:
     type: str
     default: "127.0.0.1"

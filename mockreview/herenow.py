@@ -9,19 +9,21 @@ submit path as a local POST.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import tarfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from . import browsercheck, config, locks, passwords, service, store
+from . import browsercheck, config, locks, passwords, service, settings, store
 from . import secrets
 from .store import ReviewError
 
@@ -90,6 +92,9 @@ def api_key() -> str:
 
 def _api(method: str, path: str, timeout: float = 20.0,
          body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    alias = _selfhost_alias()
+    if alias:
+        return _api_ssh(alias, method, path, timeout, body=body)
     req = urllib.request.Request(
         config.HERENOW_API + path,
         method=method,
@@ -231,15 +236,115 @@ def build_site(data: Dict[str, Any], dest: Path) -> Path:
     return dest
 
 
+_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_BASE_RE = re.compile(r"https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?")
+_SLUG = r"[a-z0-9][a-z0-9-]{1,80}"
+# The only requests the owner transport may send; fullmatch, so nothing can ride along in the remote command.
+_OWNER_PATH = re.compile(r"/publish/%s(/metadata)?|/publishes/%s/data/feedback(\?[A-Za-z0-9=&]{0,200})?" % (_SLUG, _SLUG))
+
+
+def _selfhost_alias() -> str:
+    """The ssh host alias of the self-hosted publish server's owner endpoint, or "" for here.now."""
+    alias = settings.get("selfhost_ssh")
+    if not alias:
+        return ""
+    if not _ALIAS_RE.fullmatch(alias):
+        raise HereNowError("selfhost_ssh must be an ssh host alias (letters, digits, dot, dash, underscore)", 409)
+    if not _BASE_RE.fullmatch(settings.get("selfhost_base") or ""):
+        raise HereNowError("selfhost_base must be an https URL when selfhost_ssh is set", 409)
+    return alias
+
+
+def _api_ssh(alias: str, method: str, path: str, timeout: float, body: Optional[Dict[str, Any]] = None,
+             raw: Optional[bytes] = None) -> Dict[str, Any]:
+    """One owner request through ssh. The host forces a wrapper that runs a fixed curl against the loopback owner
+    listener, so the only thing sent is "<METHOD> <path>" plus the body on stdin. The wrapper prints the response body,
+    then a final line "STATUS <http code>". Nothing from stderr is ever put in an error."""
+    if method not in ("PUT", "PATCH", "GET", "DELETE") or not _OWNER_PATH.fullmatch(path):
+        raise HereNowError("selfhost request refused", 400)
+    stdin = raw if raw is not None else (json.dumps(body).encode("utf-8") if body is not None else b"")
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
+            "--", alias, f"{method} {path}"]
+    try:
+        proc = subprocess.run(argv, input=stdin, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise HereNowError("selfhost ssh timed out", 504) from None
+    except OSError:
+        raise HereNowError("selfhost ssh could not run", 502) from None
+    if proc.returncode != 0:
+        raise HereNowError(f"selfhost ssh failed (exit {proc.returncode})", 502)
+    head, _, tail = proc.stdout.rpartition(b"\nSTATUS ")
+    try:
+        status = int(tail.strip())
+    except ValueError:
+        raise HereNowError("selfhost ssh returned no status", 502) from None
+    if status >= 400:
+        raise HereNowError(f"selfhost {method} failed (HTTP {status})", status)
+    try:
+        return json.loads(head or b"{}")
+    except ValueError:
+        raise HereNowError("selfhost ssh returned invalid JSON", 502) from None
+
+
+def _tar_site(site: Path) -> bytes:
+    """The built site as a plain tar: regular files only, no links, no hidden entries (the here.now manifest is hidden),
+    owner and mode normalised. The server re-validates every entry."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for f in sorted(site.rglob("*")):
+            rel = f.relative_to(site)
+            if f.is_symlink() or not f.is_file() or any(p.startswith(".") for p in rel.parts):
+                continue
+            info = tf.gettarinfo(str(f), arcname=rel.as_posix())
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            info.mode = 0o644
+            with open(f, "rb") as fh:
+                tf.addfile(info, fh)
+    return buf.getvalue()
+
+
+def _publish_selfhost(site: Path, slug: Optional[str], alias: str):
+    """Upload the built site to the self-hosted server. Returns (slug, site_url, auth_mode)."""
+    slug = slug or "mr-" + os.urandom(6).hex()
+    _api_ssh(alias, "PUT", f"/publish/{slug}", 300.0, raw=_tar_site(site))
+    return slug, settings.get("selfhost_base").rstrip("/") + f"/{slug}/", "authenticated"
+
+
+def _publish_helper(script, child_env, site: Path, rdir: Path, title: str, existing_slug: Optional[str]):
+    """Publish through the here.now publish helper. Returns (slug, site_url, auth_mode)."""
+    cmd = ["bash", str(script), str(site), "--client", "hermes", "--title", f"Mock review: {title}"[:80]]
+    if existing_slug:
+        cmd += ["--slug", existing_slug]
+    try:
+        proc = subprocess.run(cmd, cwd=str(rdir), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300, env=child_env)
+    except subprocess.TimeoutExpired:
+        raise HereNowError("here.now publish timed out after 300 s", 504)
+    results: Dict[str, str] = {}
+    for line in (proc.stderr or "").splitlines():
+        if line.startswith("publish_result.") and "=" in line:
+            k, v = line[len("publish_result."):].split("=", 1)
+            results[k] = v.strip()
+    slug, url = results.get("slug", ""), results.get("site_url", "")
+    if proc.returncode != 0 or not SLUG_RE.match(slug or "") or not url.startswith("https://"):
+        raise HereNowError(f"here.now publish failed (exit {proc.returncode}); check the publish helper", 502)
+    if results.get("auth_mode") != "authenticated":
+        log.warning("here.now publish was not authenticated — Site Data will return 403 account_required")
+    return slug, url, results.get("auth_mode")
+
+
 def publish(review_id: str, verify: bool = True) -> Dict[str, Any]:
     """Build and publish (create or update) the review's site via the here.now publish helper. A gated prototype is
     then loaded in a browser behind its password (see _verify_site); the poller's quiet republish skips that."""
-    try:
-        script = config.herenow_publish_script()
-    except FileNotFoundError as e:
-        raise HereNowError(str(e), 409)
-    key = api_key()  # Must be nonempty before the helper can run.
-    child_env = dict(os.environ, HERENOW_API_KEY=key)
+    alias = _selfhost_alias()
+    script = child_env = None
+    if not alias:
+        try:
+            script = config.herenow_publish_script()
+        except FileNotFoundError as e:
+            raise HereNowError(str(e), 409)
+        key = api_key()  # Must be nonempty before the helper can run.
+        child_env = dict(os.environ, HERENOW_API_KEY=key)
     store.load(review_id)
     rdir = store.review_dir(review_id)
     with locks.exclusive(rdir / ".publish.lock"):
@@ -248,27 +353,14 @@ def publish(review_id: str, verify: bool = True) -> Dict[str, Any]:
             raise ReviewError("only open herenow reviews can be published", 409)
         hn = data.get("herenow") or {}
         site = build_site(data, rdir / "site")
-        cmd = ["bash", str(script), str(site), "--client", "hermes", "--title", f"Mock review: {data['title']}"[:80]]
-        if hn.get("slug"):
-            cmd += ["--slug", hn["slug"]]
-        try:
-            proc = subprocess.run(cmd, cwd=str(rdir), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300, env=child_env)
-        except subprocess.TimeoutExpired:
-            raise HereNowError("here.now publish timed out after 300 s", 504)
-        results: Dict[str, str] = {}
-        for line in (proc.stderr or "").splitlines():
-            if line.startswith("publish_result.") and "=" in line:
-                k, v = line[len("publish_result."):].split("=", 1)
-                results[k] = v.strip()
-        slug, url = results.get("slug", ""), results.get("site_url", "")
-        if proc.returncode != 0 or not SLUG_RE.match(slug or "") or not url.startswith("https://"):
-            raise HereNowError(f"here.now publish failed (exit {proc.returncode}); check the publish helper", 502)
-        if results.get("auth_mode") != "authenticated":
-            log.warning("here.now publish was not authenticated — Site Data will return 403 account_required")
+        if alias:
+            slug, url, auth_mode = _publish_selfhost(site, hn.get("slug"), alias)
+        else:
+            slug, url, auth_mode = _publish_helper(script, child_env, site, rdir, data["title"], hn.get("slug"))
         with store.locked(review_id):
             data = store.load(review_id)
             data.setdefault("herenow", {}).update(slug=slug, site_url=url, published_at=store.now_iso(),
-                                                  auth_mode=results.get("auth_mode"), site_gone_at=None)
+                                                  auth_mode=auth_mode, site_gone_at=None)
             store.save(review_id, data)
         # Legacy reviews stay public until explicitly toggled. Never remove a gate on a
         # normal unprotected republish; retry an interrupted/failed removal, however.
