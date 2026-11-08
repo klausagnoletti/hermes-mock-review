@@ -51,6 +51,7 @@ def test_api_runs_one_fixed_ssh_command_and_parses_the_body(selfhost, monkeypatc
     assert herenow._api("GET", "/publishes/alpha-1/data/feedback?limit=100") == {"records": []}
     argv = fake.calls[0]["argv"]
     assert argv[0] == "ssh" and "BatchMode=yes" in argv and "ConnectTimeout=10" in argv
+    assert "-T" in argv and "ClearAllForwardings=yes" in argv and argv.index("-T") < argv.index("--")
     assert argv[-3:] == ["--", "ownerbox", "GET /publishes/alpha-1/data/feedback?limit=100"]
     assert fake.calls[0]["kw"].get("shell") is not True
 
@@ -312,6 +313,25 @@ def recorder():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield seen, f"http://127.0.0.1:{srv.server_address[1]}"
     srv.shutdown()
+
+
+def test_wrapper_uses_its_own_pinned_path_not_the_callers(tmp_path, owner_listener):
+    app, url = owner_listener
+    fake = tmp_path / "fakebin"
+    fake.mkdir()
+    (fake / "curl").write_text(f"#!/bin/sh\necho hijacked > {tmp_path}/marker\nexit 0\n", encoding="utf-8")
+    (fake / "curl").chmod(0o755)
+    env = {"PATH": f"{fake}:{os.environ['PATH']}", "SELFNOW_OWNER_URL": url,
+           "SSH_ORIGINAL_COMMAND": "GET /publishes/alpha-1/data/feedback"}
+    r = subprocess.run(["sh", str(WRAPPER)], capture_output=True, env=env, timeout=60)
+    assert not (tmp_path / "marker").exists() and b"STATUS" in r.stdout
+
+
+def test_wrapper_only_speaks_http(tmp_path):
+    (tmp_path / "publishes" / "alpha-1" / "data").mkdir(parents=True)
+    (tmp_path / "publishes" / "alpha-1" / "data" / "feedback").write_text("LEAK", encoding="utf-8")
+    r = run_wrapper("file://" + str(tmp_path), "GET /publishes/alpha-1/data/feedback")
+    assert b"LEAK" not in r.stdout and r.returncode != 0
 
 
 def test_wrapper_sends_the_body_only_with_put_and_patch_and_with_the_right_content_type(recorder):
