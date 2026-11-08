@@ -519,3 +519,22 @@ def test_the_password_and_cookie_key_are_not_stored_in_clear(app, tmp_path):
         if f.is_file() and f.name != "cookie.key":
             assert PLANTED.encode() not in f.read_bytes()
     assert (tmp_path / "data" / "cookie.key").stat().st_mode & 0o077 == 0     # key file is private
+
+
+# ---- CIDR peers (container networks hand out dynamic addresses) ----------------------------------
+
+def test_proxy_and_owner_peers_accept_cidr_ranges(tmp_path, clock):
+    app = selfnow.App(data_dir=tmp_path / "d", public_host=HOST, clock=clock,
+                      trusted_proxies=("10.9.0.0/24",), owner_peers=("127.0.0.1", "172.19.0.1/32", "fd00:1::/64"))
+    assert app._client({"x-forwarded-for": "203.0.113.9"}, "10.9.0.77") == "203.0.113.9"      # inside the range
+    assert app._client({"x-forwarded-for": "203.0.113.9"}, "10.9.1.77") == "10.9.1.77"        # just outside
+    assert owner(app, "GET", "/publishes/x1/data/feedback", peer="172.19.0.1").status == 404   # allowed, no such slug
+    assert owner(app, "GET", "/publishes/x1/data/feedback", peer="172.19.0.5").status == 403
+    assert owner(app, "GET", "/publishes/x1/data/feedback", peer="fd00:1::5").status == 404
+    assert owner(app, "GET", "/publishes/x1/data/feedback", peer="not-an-address").status == 403
+    assert owner(app, "GET", "/publishes/x1/data/feedback", peer="10.9.0.77").status == 403    # the proxy is not the owner
+
+
+def test_a_bad_network_in_settings_fails_at_start(tmp_path, clock):
+    with pytest.raises(ValueError):
+        selfnow.App(data_dir=tmp_path / "d", public_host=HOST, clock=clock, trusted_proxies=("not-a-network",))

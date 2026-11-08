@@ -68,6 +68,18 @@ def _err(status: int, message: str, headers: Optional[Dict[str, str]] = None) ->
     return _json(status, {"ok": False, "error": message}, headers)
 
 
+def _nets(items) -> tuple:
+    return tuple(ipaddress.ip_network(s, strict=False) for s in items)
+
+
+def _match(peer: str, nets) -> bool:
+    try:
+        ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    return any(n.version == ip.version and ip in n for n in nets)
+
+
 class App:
     def __init__(self, data_dir, public_host: str, clock: Callable[[], float] = time.time,
                  trusted_proxies: Tuple[str, ...] = (), owner_peers: Tuple[str, ...] = LOOPBACK,
@@ -80,6 +92,8 @@ class App:
         self.clock = clock
         self.trusted_proxies = tuple(trusted_proxies)
         self.owner_peers = tuple(owner_peers)
+        self._proxy_nets = _nets(self.trusted_proxies)
+        self._owner_nets = _nets(self.owner_peers)
         self.max_records_per_slug = max_records_per_slug
         self.max_total_bytes = max_total_bytes
         self.max_slugs = max_slugs
@@ -135,7 +149,7 @@ class App:
 
     def _client(self, headers: Dict[str, str], peer: str) -> str:
         who = peer
-        if peer in self.trusted_proxies:
+        if _match(peer, self._proxy_nets):
             fwd = headers.get("x-forwarded-for", "")
             parts = [p.strip() for p in fwd.split(",") if p.strip()]
             if parts:
@@ -305,7 +319,7 @@ class App:
     # ---- owner listener --------------------------------------------------------------------------
 
     def owner(self, method: str, path: str, headers: Dict[str, str], body: bytes, peer: str) -> Response:
-        if peer not in self.owner_peers:
+        if not _match(peer, self._owner_nets):
             return self._secure(_err(403, "owner routes are loopback only"))
         if BAD_PATH.search(path):
             return self._secure(_err(400, "bad path"))
