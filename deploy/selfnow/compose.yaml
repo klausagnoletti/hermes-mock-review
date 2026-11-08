@@ -1,0 +1,36 @@
+# Self-hosted publish server. Run as its own compose project on its own network; the reverse proxy joins that
+# network and proxies the public listener by service name. The owner listener is published to host loopback only.
+# Every value below comes from the environment, nothing site-specific lives in this file (see README in this folder).
+name: selfnow
+
+services:
+  selfnow:
+    build:
+      context: ../..
+      dockerfile: deploy/selfnow/Dockerfile
+    image: selfnow:local
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 128
+    tmpfs: ["/tmp:size=16m"]
+    volumes:
+      - "${SELFNOW_DATA:?set SELFNOW_DATA to a host directory owned by uid 10001}:/data"
+    command:
+      - "--data=/data"
+      - "--public-host=${SELFNOW_PUBLIC_HOST:?set SELFNOW_PUBLIC_HOST}"
+      - "--proxy=${SELFNOW_SUBNET:?set SELFNOW_SUBNET}"
+      - "--owner-peer=${SELFNOW_OWNER_PEER:?set SELFNOW_OWNER_PEER to the network gateway address}"
+    ports:
+      - "127.0.0.1:${SELFNOW_OWNER_PORT:-8081}:8081"
+    networks: [board]
+
+networks:
+  board:
+    name: selfnow_board
+    ipam:
+      config:
+        - subnet: "${SELFNOW_SUBNET:?set SELFNOW_SUBNET}"
