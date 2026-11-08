@@ -454,3 +454,87 @@ class App:
                 shutil.rmtree(d, ignore_errors=True)
                 removed += 1
         return removed
+
+
+# ---- HTTP wrappers (move bytes only; every decision is in App) -------------------------------------
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
+
+REQUEST_TIMEOUT_S = 30
+
+
+def make_server(app: App, kind: str, host: str, port: int) -> ThreadingHTTPServer:
+    """kind is 'public' or 'owner'. The body limit is enforced here, before anything is buffered."""
+    limit = MAX_PUBLIC_BODY if kind == "public" else app.max_total_bytes
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "selfnow"
+        sys_version = ""
+        protocol_version = "HTTP/1.1"
+        timeout = REQUEST_TIMEOUT_S
+
+        def log_message(self, *args) -> None:       # no request logging: paths and bodies stay out of logs
+            return
+
+        def _handle(self) -> None:
+            raw_len = self.headers.get("Content-Length")
+            body = b""
+            if self.command in ("POST", "PUT", "PATCH"):
+                if raw_len is None or not raw_len.isdigit():
+                    return self._send(App._secure(_err(411, "content-length required")), close=True)
+                if int(raw_len) > limit:
+                    return self._send(App._secure(_err(413, "request too large")), close=True)
+                body = self.rfile.read(int(raw_len))
+            handler = app.public if kind == "public" else app.owner
+            self._send(handler(self.command, self.path, dict(self.headers.items()), body, self.client_address[0]))
+
+        def _send(self, resp: Response, close: bool = False) -> None:
+            body = b"" if self.command == "HEAD" else resp.body
+            self.send_response(resp.status)
+            for k, v in resp.headers.items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(resp.body)))
+            if close:
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_HEAD = do_POST = do_PUT = do_PATCH = do_DELETE = _handle
+
+    srv = ThreadingHTTPServer((host, port), Handler)
+    srv.daemon_threads = True
+    return srv
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    import argparse
+    import threading
+    p = argparse.ArgumentParser(description="self-hosted publish server")
+    p.add_argument("--data", required=True)
+    p.add_argument("--public-host", required=True, help="the Host header the reverse proxy sends")
+    p.add_argument("--public-bind", default="0.0.0.0")
+    p.add_argument("--public-port", type=int, default=8080)
+    p.add_argument("--owner-bind", default="0.0.0.0")
+    p.add_argument("--owner-port", type=int, default=8081)
+    p.add_argument("--proxy", action="append", default=[], help="reverse proxy peer address (repeatable)")
+    p.add_argument("--owner-peer", action="append", default=[], help="extra allowed owner peer, e.g. the bridge gateway")
+    p.add_argument("--retention-days", type=int, default=30)
+    a = p.parse_args(argv)
+    app = App(a.data, a.public_host, trusted_proxies=tuple(a.proxy), owner_peers=LOOPBACK + tuple(a.owner_peer),
+              retention_days=a.retention_days)
+
+    def sweeper() -> None:
+        while True:
+            app.sweep()
+            time.sleep(6 * 3600)
+
+    threading.Thread(target=sweeper, daemon=True).start()
+    pub = make_server(app, "public", a.public_bind, a.public_port)
+    own = make_server(app, "owner", a.owner_bind, a.owner_port)
+    threading.Thread(target=own.serve_forever, daemon=True).start()
+    pub.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

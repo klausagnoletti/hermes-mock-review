@@ -396,3 +396,53 @@ def test_list_pagination_returns_a_stable_cursor(app):
     assert len(second["records"]) == 1 and second["nextCursor"] in (None, "")
     ids = [r["id"] for r in first["records"] + second["records"]]
     assert ids == sorted(ids) and len(set(ids)) == 3
+
+
+# ---- real listeners ---------------------------------------------------------------------------
+
+def _serve(app, kind):
+    import threading
+    srv = selfnow.make_server(app, kind, "127.0.0.1", 0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_real_listener_refuses_an_oversize_body_before_reading_it(app):
+    import http.client
+    publish(app)
+    srv = _serve(app, "public")
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+        c.putrequest("POST", "/alpha-1/.herenow/data/feedback")
+        c.putheader("Host", HOST)
+        c.putheader("Content-Type", "application/json")
+        c.putheader("Content-Length", str(10 * 1024 * 1024))      # promised, never sent
+        c.endheaders()
+        r = c.getresponse()
+        assert r.status == 413 and r.getheader("connection", "").lower() == "close"
+    finally:
+        srv.shutdown()
+
+
+def test_real_listener_round_trip_and_headers(tmp_path, clock):
+    import http.client
+    # peer is 127.0.0.1 for both listeners here; trust it as the proxy so X-Forwarded-For is honoured
+    app = selfnow.App(data_dir=tmp_path / "d", public_host=HOST, clock=clock, trusted_proxies=("127.0.0.1",))
+    pub, own = _serve(app, "public"), _serve(app, "owner")
+    try:
+        oc = http.client.HTTPConnection("127.0.0.1", own.server_address[1], timeout=5)
+        oc.request("PUT", "/publish/alpha-1", body=make_tar(SITE))
+        assert oc.getresponse().read() and True
+        oc = http.client.HTTPConnection("127.0.0.1", own.server_address[1], timeout=5)
+        oc.request("PATCH", "/publish/alpha-1/metadata", body=json.dumps({"password": "pw-correct-horse"}))
+        assert oc.getresponse().status == 200
+        pc = http.client.HTTPConnection("127.0.0.1", pub.server_address[1], timeout=5)
+        pc.request("GET", "/alpha-1/", headers={"Host": HOST})
+        r = pc.getresponse()
+        assert r.status == 401 and r.getheader("x-content-type-options") == "nosniff" and b"password" in r.read()
+        pc = http.client.HTTPConnection("127.0.0.1", pub.server_address[1], timeout=5)
+        pc.request("DELETE", "/publish/alpha-1", headers={"Host": HOST})
+        assert pc.getresponse().status in (404, 405)               # owner routes do not exist publicly
+    finally:
+        pub.shutdown()
+        own.shutdown()
