@@ -154,11 +154,24 @@ class App:
 
     # ---- headers ---------------------------------------------------------------------------------
 
+    def _origin_ok(self, headers: Dict[str, str]) -> bool:
+        """A POST is accepted without an Origin (not a browser), from this site's own origin, or with "Origin: null" only
+        when the browser itself marks the request same-origin: a page with a no-referrer policy (the board's own meta
+        tag) makes the browser send null on its own POSTs, while a sandboxed frame or a foreign page does not send
+        Sec-Fetch-Site: same-origin."""
+        origin = headers.get("origin")
+        if origin is None:
+            return True
+        origin = origin.strip().lower()
+        if origin == "https://" + self.public_host:
+            return True
+        return origin == "null" and headers.get("sec-fetch-site", "").strip().lower() == "same-origin"
+
     @staticmethod
     def _secure(resp: Response, csp: str = BOARD_CSP) -> Response:
         h = resp.headers
         h.setdefault("x-content-type-options", "nosniff")
-        h.setdefault("referrer-policy", "no-referrer")
+        h.setdefault("referrer-policy", "same-origin")
         h.setdefault("content-security-policy", csp)
         h.setdefault("cache-control", "no-store")
         return resp
@@ -248,8 +261,7 @@ class App:
         slug, rest = parts[1], parts[2:]
         meta = self._meta(slug)
         if method == "POST":
-            origin = headers.get("origin")
-            if origin is not None and origin.strip().lower() != "https://" + self.public_host:
+            if not self._origin_ok(headers):
                 return self._secure(_err(403, "cross-origin requests are not accepted"))
             if len(body) > MAX_PUBLIC_BODY:
                 return self._secure(_err(413, "request too large"))

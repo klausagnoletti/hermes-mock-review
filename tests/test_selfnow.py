@@ -223,6 +223,34 @@ def test_cross_origin_post_is_403(app):
     assert r.status == 403
 
 
+def _unlock_status(app, origin, fetch_site):
+    """The password is wrong on purpose: an accepted Origin reaches the password check (401), a refused one stops at 403."""
+    headers = {"content-type": "application/x-www-form-urlencoded"}
+    if origin is not None:
+        headers["origin"] = origin
+    if fetch_site is not None:
+        headers["sec-fetch-site"] = fetch_site
+    return public(app, "POST", "/alpha-1/unlock", b"password=wrong", headers).status
+
+
+def test_a_null_origin_is_accepted_only_with_the_browsers_same_origin_signal(app):
+    # A page with a no-referrer policy (the board's own meta tag) makes the browser send "Origin: null" on its own POSTs.
+    publish(app)
+    assert _unlock_status(app, "null", "same-origin") == 401
+    assert _unlock_status(app, "null", None) == 403
+    assert _unlock_status(app, "null", "cross-site") == 403
+    assert _unlock_status(app, "null", "same-site") == 403
+    assert _unlock_status(app, "null", "none") == 403
+
+
+def test_the_same_origin_signal_never_rescues_a_foreign_origin(app):
+    publish(app)
+    assert _unlock_status(app, "https://evil.example.test", "same-origin") == 403
+    assert _unlock_status(app, "https://evil.example.test", None) == 403
+    assert _unlock_status(app, "https://" + app.public_host, None) == 401
+    assert _unlock_status(app, None, None) == 401
+
+
 def test_body_over_16kb_is_413_on_the_public_listener(app):
     publish(app)
     c = cookie_of(unlock(app))
@@ -312,7 +340,9 @@ def test_every_response_has_the_security_headers(app):
     for r in (public(app, "GET", "/alpha-1/"), public(app, "GET", "/ghost-1/"),
               app.public("GET", "/alpha-1/", {"host": "evil.example.test"}, b"", PROXY)):
         assert r.headers["x-content-type-options"] == "nosniff"
-        assert r.headers["referrer-policy"] == "no-referrer"
+        # same-origin, never no-referrer: with no-referrer a browser sends "Origin: null" on its own form and fetch
+        # POSTs, which the cross-origin check must refuse, so no reviewer could unlock or submit (found live in a browser)
+        assert r.headers["referrer-policy"] == "same-origin"
         assert "content-security-policy" in r.headers
         assert r.headers["cache-control"] == "no-store"
 
