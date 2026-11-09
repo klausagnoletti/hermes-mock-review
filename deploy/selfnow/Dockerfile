@@ -6,7 +6,7 @@ RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin self
 WORKDIR /app
 COPY mockreview/__init__.py /app/mockreview/__init__.py
 COPY mockreview/selfnow.py /app/mockreview/selfnow.py
-ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 MALLOC_ARENA_MAX=2
 USER 10001:10001
 EXPOSE 8080 8081
 # 404 from the owner listener on loopback means the process is up and answering.
